@@ -1,39 +1,428 @@
-# Arquitetura do Sistema de Embarque - SO2 (Trabalho 2)
+# Arquitetura do Sistema de Embarque — SO2 (Trabalho 2)
+
+## Índice
+1. [Visão Geral](#1-visão-geral)
+2. [Estrutura de Ficheiros](#2-estrutura-de-ficheiros)
+3. [Configuração Partilhada — `common/config.py`](#3-configuração-partilhada--commonconfigpy)
+4. [Gestor de Memória Partilhada — `common/ipc_manager.py`](#4-gestor-de-memória-partilhada--commonipc_managerpy)
+5. [Servidor (Aeroporto) — `aeroportoServidor/servidor.py`](#5-servidor-aeroporto--aeroportoservidorservidorpy)
+6. [Cliente (Passageiros) — `passageirosCliente/gerador_clientes.py`](#6-cliente-passageiros--passageirosclientegerador_clientespy)
+7. [Fluxo Completo Passo-a-Passo](#7-fluxo-completo-passo-a-passo)
+8. [Mecanismos de Sincronização](#8-mecanismos-de-sincronização)
+9. [Diagrama de Sequência](#9-diagrama-de-sequência)
+10. [Como Executar (2 PCs)](#10-como-executar-2-pcs)
+
+---
 
 ## 1. Visão Geral
-O sistema foi concebido para funcionar de forma distribuída (em 2 PCs diferentes), como exigido. Para permitir a **memória partilhada** e o uso de **semáforos** através da rede (já que a memória partilhada nativa do SO não funciona entre computadores diferentes), utilizámos o `multiprocessing.managers.SyncManager` nativo do Python. 
 
-O `SyncManager` permite criar um Servidor que aloja os objetos partilhados na memória (Listas, Dicionários, Semáforos e Locks) e os expõe através de uma porta de rede. O Cliente liga-se a essa porta e manipula os objetos como se estivessem na sua própria memória local.
+O sistema simula o embarque de passageiros num aeroporto. Existem dois programas independentes:
 
-## 2. Componentes e Partilha de Memória
-A comunicação assenta no ficheiro `common/ipc_manager.py`, que define os seguintes recursos partilhados:
-- **Fila de Embarque (`list` partilhada)**: Guarda os passageiros que estão à espera.
-- **Lock da Fila (`Lock`)**: Garante exclusão mútua quando os processos cliente adicionam passageiros ou desistem, e quando o servidor remove o passageiro de maior prioridade, evitando *Race Conditions*.
-- **Semáforo de Portões (`Semaphore`)**: Limita o acesso simultâneo aos portões. Inicializado com o número de portões (ex: 3).
-- **Semáforo de Agentes (`Semaphore`)**: Limita o número de embarques em simultâneo.
-- **Dicionário de Estados (`dict` partilhado)**: Permite ao passageiro saber quando terminou de embarcar.
-- **Fila de Logs (`Queue`)**: Usada para enviar mensagens de log centralizadas para o servidor.
+| Componente | Papel | Ficheiro |
+|---|---|---|
+| **Servidor (Aeroporto)** | Gere a fila de embarque, aloca portões e agentes, regista logs | `aeroportoServidor/servidor.py` |
+| **Cliente (Passageiros)** | Gera passageiros aleatoriamente, insere-os na fila, aguarda embarque ou desiste | `passageirosCliente/gerador_clientes.py` |
 
-## 3. Servidor (Aeroporto)
-O `aeroportoServidor/servidor.py` tem as seguintes responsabilidades:
-1. **Iniciar o IPC Manager**: Abre a porta na rede para receber os clientes.
-2. **Gestor de Embarque**: Uma thread principal observa continuamente a Fila de Embarque. Quando há passageiros, tenta adquirir (via `acquire()`) um Portão e um Agente.
-3. **Simulação de Embarque**: Cria uma thread (Agente) para o passageiro que processa o embarque (tempo varia com a prioridade). No fim, liberta os recursos (via `release()`) e atualiza o estado para "embarcado".
-4. **Logger**: Uma thread dedicada a consumir a Fila de Logs e a escrever no ficheiro `aeroporto.log`.
+### Porquê `SyncManager` e não `shm_open`?
 
-## 4. Cliente (Passageiros)
-O `passageirosCliente/gerador_clientes.py` atua da seguinte forma:
-1. Liga-se ao IPC Manager do Servidor usando o IP e Porta definidos.
-2. **Gerador**: Periodicamente (simulando também picos de tráfego), lança novas *Threads* para cada Passageiro.
-3. **Ciclo de Vida do Passageiro**:
-   - Calcula a sua prioridade e insere-se na Fila de Embarque, reordenando a lista (Prioridade Alta > Média > Baixa, desempate por tempo de chegada). Exige Lock.
-   - Fica num ciclo de espera (*polling* eficiente) a verificar o Dicionário de Estados.
-   - Se o tempo de espera exceder o limite (ex: 15s), o passageiro **desiste**, usa o Lock para se retirar da lista e termina.
+A memória partilhada POSIX nativa (`shm_open`, `mmap`) só funciona entre processos **no mesmo computador**. Como o enunciado exige que o sistema funcione em **2 PCs diferentes na mesma rede**, usamos o `multiprocessing.managers.SyncManager` do Python. Este cria um servidor TCP que expõe objetos Python (listas, dicionários, locks, semáforos) pela rede. Os clientes ligam-se via TCP e manipulam esses objetos remotamente através de **objetos proxy**, como se fossem locais. Internamente, cada chamada a um método do proxy é serializada, enviada pela rede, executada no servidor, e o resultado é devolvido — tudo de forma transparente.
 
-## 5. Como Executar (Em 2 PCs)
-1. **No PC do Servidor**:
-   - Edite `common/config.py` e coloque `SERVER_IP = '0.0.0.0'` (ou o IP real da LAN).
-   - Execute `python3 aeroportoServidor/servidor.py`.
-2. **No PC do Cliente**:
-   - Edite `common/config.py` e coloque `SERVER_IP = '<IP_DO_SERVIDOR>'`.
-   - Execute `python3 passageirosCliente/gerador_clientes.py`.
+---
+
+## 2. Estrutura de Ficheiros
+
+```
+SO2/
+├── common/                          # Código partilhado entre Servidor e Cliente
+│   ├── __init__.py                  # Torna 'common' num pacote Python importável
+│   ├── config.py                    # Todas as constantes de configuração
+│   └── ipc_manager.py              # Definição do Manager e registo dos objetos partilhados
+├── aeroportoServidor/               # Código do Servidor
+│   ├── __init__.py
+│   ├── servidor.py                  # Processo principal do aeroporto
+│   └── aeroporto.log               # Ficheiro de log gerado automaticamente
+├── passageirosCliente/              # Código do Cliente
+│   ├── __init__.py
+│   └── gerador_clientes.py         # Gerador de passageiros
+├── .gitignore                       # Ignora .DS_Store, __pycache__, *.log
+├── ARCHITECTURE.md                  # Este ficheiro
+└── Trabalho_2_2526.pdf              # Enunciado do trabalho
+```
+
+---
+
+## 3. Configuração Partilhada — `common/config.py`
+
+Este ficheiro contém **todas** as constantes usadas por ambos os componentes. Ao alterar um valor aqui, o comportamento muda em todo o sistema.
+
+| Variável | Valor | Função |
+|---|---|---|
+| `SERVER_IP` | `'127.0.0.1'` | IP do servidor. Mudar para o IP da LAN quando se testa em 2 PCs. |
+| `SERVER_PORT` | `50000` | Porta TCP usada pelo Manager para comunicação. |
+| `AUTHKEY` | `b'so2_aeroporto_secreto'` | Chave de autenticação. O cliente e o servidor precisam da mesma chave para se ligarem. Impede ligações não autorizadas. |
+| `NUM_PORTOES` | `3` | Nº de portões de embarque simultâneos (valor inicial do semáforo de portões). |
+| `NUM_AGENTES` | `4` | Nº de agentes de embarque simultâneos (valor inicial do semáforo de agentes). |
+| `TEMPO_LIMITE_ESPERA` | `15` | Segundos máximos que um passageiro espera antes de desistir. |
+| `PRIORIDADES` | `{'ALTA': 1, 'MEDIA': 2, 'BAIXA': 3}` | Mapeamento de prioridades. O valor numérico mais baixo = mais prioritário. |
+
+**Nota sobre `SERVER_IP`**: No servidor, o código converte automaticamente `'127.0.0.1'` para `'0.0.0.0'` (aceitar ligações de qualquer interface de rede). No cliente, este valor é usado diretamente como endereço de destino.
+
+---
+
+## 4. Gestor de Memória Partilhada — `common/ipc_manager.py`
+
+Este é o módulo central de IPC (Inter-Process Communication). Define **que objetos existem na memória partilhada** e como são expostos pela rede.
+
+### 4.1. Classe `SharedMemoryManager`
+
+```python
+class SharedMemoryManager(multiprocessing.managers.SyncManager):
+    pass
+```
+
+Herda de `SyncManager`. Este é o "contentor" que vai alojar e servir os objetos partilhados. Tanto o servidor como o cliente instanciam esta classe, mas com papéis diferentes:
+- **Servidor**: Cria uma instância, regista os objetos com `callable=...`, e chama `get_server().serve_forever()`.
+- **Cliente**: Cria uma instância, regista os nomes (sem `callable`), e chama `.connect()`.
+
+### 4.2. Variáveis Globais do Módulo
+
+```python
+_fila_embarque = None   # Lista Python []
+_lock_fila = None       # multiprocessing.Lock
+_sem_portoes = None     # multiprocessing.Semaphore
+_sem_agentes = None     # multiprocessing.Semaphore
+_d_estados = None       # Dicionário Python {}
+_log_queue = None       # queue.Queue
+```
+
+Estas variáveis **só existem com valores reais no processo do Servidor**. No cliente, nunca são inicializadas diretamente — o cliente acede-as remotamente através dos proxies.
+
+Cada variável tem uma função `get_*()` associada (ex: `get_fila_embarque()`) que simplesmente retorna a variável global. Estas funções são passadas como `callable` ao `register()`.
+
+### 4.3. Função `setup_server_manager(num_portoes, num_agentes)`
+
+**Chamada apenas pelo Servidor.** Faz duas coisas:
+
+**Passo 1 — Cria os objetos reais:**
+| Objeto | Tipo | Função |
+|---|---|---|
+| `_fila_embarque` | `list` (`[]`) | Fila de passageiros ordenada por prioridade |
+| `_lock_fila` | `multiprocessing.Lock` | Exclusão mútua para aceder à fila |
+| `_sem_portoes` | `multiprocessing.Semaphore(3)` | Conta e limita portões disponíveis |
+| `_sem_agentes` | `multiprocessing.Semaphore(4)` | Conta e limita agentes disponíveis |
+| `_d_estados` | `dict` (`{}`) | Mapeia `id_passageiro → estado` (`'esperando'`, `'embarcado'`, `'desistiu'`) |
+| `_log_queue` | `queue.Queue` | Fila FIFO thread-safe para mensagens de log dos clientes |
+
+**Passo 2 — Regista os métodos no Manager:**
+```python
+SharedMemoryManager.register('get_fila', callable=get_fila_embarque, proxytype=ListProxy)
+```
+Isto diz ao Manager: "quando alguém (local ou remoto) chamar `manager.get_fila()`, executa a função `get_fila_embarque()` e devolve o resultado empacotado num `ListProxy`". O `ListProxy` permite operações como `append()`, `pop()`, `len()`, e `fila[:] = ...` remotamente.
+
+### 4.4. Função `get_client_manager()`
+
+**Chamada apenas pelo Cliente.** Regista os mesmos nomes mas **sem `callable`**, pois o cliente não vai criar os objetos — vai recebê-los do servidor pela rede.
+
+```python
+SharedMemoryManager.register('get_fila')  # sem callable
+```
+
+---
+
+## 5. Servidor (Aeroporto) — `aeroportoServidor/servidor.py`
+
+### 5.1. Arranque e Logging (linhas 1–21)
+
+O servidor configura o módulo `logging` do Python com **dois handlers**:
+- `FileHandler` → Escreve no ficheiro `aeroportoServidor/aeroporto.log`
+- `StreamHandler` → Imprime no terminal (stdout)
+
+Formato: `2026-05-06 12:23:17,547 - [INFO] - mensagem`
+
+Ambos os handlers recebem as mesmas mensagens, garantindo que tudo o que aparece no terminal fica também gravado no ficheiro.
+
+### 5.2. Thread `processa_logs(log_queue)` (linhas 23–34)
+
+Esta é uma thread dedicada que corre num ciclo infinito (`while True`). A sua única função é consumir mensagens da `log_queue` partilhada:
+
+1. Chama `log_queue.get()` — este método **bloqueia** até haver uma mensagem disponível (não consome CPU à espera).
+2. Quando recebe uma string, escreve-a no logger com o prefixo `(Cliente)`.
+3. Se receber a string `"STOP"`, termina o ciclo.
+
+**Porquê uma thread separada?** Porque os clientes (remotos) colocam mensagens na queue a qualquer momento. Se o servidor tentasse ler a queue no ciclo principal, ficaria bloqueado e não processaria embarques.
+
+### 5.3. Função `embarcar_passageiro(...)` (linhas 36–60)
+
+Esta função é executada numa **thread separada** para cada passageiro que embarca. Recebe:
+- `passageiro`: dicionário `{'id': int, 'prioridade': int, 'chegada': float}`
+- `sem_portoes`: proxy do semáforo de portões
+- `sem_agentes`: proxy do semáforo de agentes
+- `d_estados`: proxy do dicionário de estados
+
+**Fluxo interno:**
+1. Calcula o tempo de embarque baseado na prioridade:
+   - Alta (1): **2 segundos**
+   - Média (2): **3 segundos**
+   - Baixa (3): **4 segundos**
+2. Calcula o tempo total de espera: `time.time() - chegada`
+3. Regista no log: "COMEÇOU o embarque"
+4. `time.sleep(tempo_embarque)` — Simula o tempo de embarque
+5. Atualiza `d_estados[p_id] = 'embarcado'` — O cliente que está em polling vai detetar isto
+6. `sem_portoes.release()` — Devolve 1 ao contador do semáforo (portão fica livre)
+7. `sem_agentes.release()` — Devolve 1 ao contador do semáforo (agente fica livre)
+8. Regista no log: "TERMINOU o embarque"
+
+**Importante**: O `acquire()` dos semáforos é feito no ciclo principal (antes de lançar esta thread). O `release()` é feito aqui dentro (depois do embarque terminar). Isto garante que os recursos ficam reservados durante todo o embarque.
+
+### 5.4. Função `main()` (linhas 62–136) — O Coração do Servidor
+
+#### Fase 1 — Inicialização (linhas 63–81)
+
+```
+setup_server_manager(3, 4)     → Cria os 6 objetos partilhados
+SharedMemoryManager(...)       → Cria o Manager TCP no endereço configurado
+manager.get_server()           → Obtém o objeto servidor TCP interno
+Thread(server.serve_forever)   → Corre o servidor TCP numa thread daemon
+```
+
+**Porquê numa thread daemon?** O `serve_forever()` é um ciclo infinito que aceita ligações de clientes. Se corresse no thread principal, bloquearia tudo. Ao correr como daemon, termina automaticamente quando o processo principal morre (Ctrl+C).
+
+#### Fase 2 — Auto-conexão local (linhas 83–92)
+
+```python
+local_client = SharedMemoryManager(address=('127.0.0.1', config.SERVER_PORT), ...)
+local_client.connect()
+fila = local_client.get_fila()
+```
+
+**Porquê ligar-se a si mesmo?** Porque o Manager expõe os objetos através de **proxies**. Para usar os mesmos proxies que os clientes remotos usam (garantindo consistência), o servidor liga-se a si mesmo como se fosse mais um cliente. Assim, `fila` é um `ListProxy`, não a lista Python direta.
+
+#### Fase 3 — Ciclo Principal de Despacho (linhas 100–129)
+
+Este é o ciclo infinito que gere o fluxo do aeroporto:
+
+```
+REPETE indefinidamente:
+│
+├─ 1. lock_fila.acquire()                    ← Pede exclusão mútua
+│     ├─ Se fila não vazia → pop(0)          ← Remove o 1º (mais prioritário)
+│     └─ lock_fila.release()                 ← Liberta o lock SEMPRE (try/finally)
+│
+├─ 2. Se obteve passageiro:
+│     ├─ sem_portoes.acquire()               ← BLOQUEIA até haver portão livre
+│     ├─ sem_agentes.acquire()               ← BLOQUEIA até haver agente livre
+│     ├─ Verifica se o passageiro desistiu   ← Se sim, devolve recursos e ignora
+│     └─ Thread(embarcar_passageiro)         ← Lança embarque em paralelo
+│
+└─ 3. Se fila vazia:
+      └─ time.sleep(0.5)                     ← Evita busy-waiting (poupa CPU)
+```
+
+**Detalhe crítico sobre o `pop(0)` + `acquire()`:** O passageiro é retirado da fila **antes** dos recursos serem adquiridos. Isto significa que, se não houver portões/agentes livres, o servidor fica bloqueado no `acquire()` a segurar aquele passageiro. Nenhum outro passageiro é processado enquanto o recurso não ficar livre. Isto é intencional: garante ordem FIFO dentro da mesma prioridade.
+
+---
+
+## 6. Cliente (Passageiros) — `passageirosCliente/gerador_clientes.py`
+
+### 6.1. Função `passageiro_process(...)` (linhas 13–72)
+
+Cada passageiro é uma **thread** que executa esta função. Recebe os proxies da fila, lock, estados e logs.
+
+#### Fase 1 — Entrada na Fila (linhas 17–45)
+
+```python
+chegada = time.time()                          # Regista timestamp UNIX da chegada
+passageiro_info = {'id': p_id, 'prioridade': prioridade, 'chegada': chegada}
+
+lock_fila.acquire()                            # Pede acesso exclusivo à fila
+lista_local = list(fila)                       # Copia a fila remota para local
+lista_local.append(passageiro_info)            # Adiciona-se
+lista_local.sort(key=lambda x: (x['prioridade'], x['chegada']))  # Ordena
+fila[:] = lista_local                          # Reescreve a fila remota
+lock_fila.release()                            # Liberta o lock
+```
+
+**Porquê copiar → modificar → reescrever?** O `ListProxy` do Manager suporta `append()`, mas **não suporta `.sort()`** diretamente. A operação `fila[:] = lista_local` substitui todo o conteúdo da lista remota de uma vez, o que é uma operação atómica do proxy.
+
+**Critério de ordenação:** `(prioridade, chegada)` — Ordena primeiro por prioridade (1 antes de 3), e em caso de empate, por ordem de chegada (FIFO). Assim, um passageiro de Primeira Classe que chegou às 12:05 fica à frente de um de Económica que chegou às 12:01.
+
+Depois, marca `d_estados[p_id] = 'esperando'` e envia uma mensagem de log para a queue.
+
+#### Fase 2 — Espera (Polling) (linhas 48–72)
+
+O passageiro entra num ciclo de polling:
+
+```
+REPETE a cada 0.5 segundos:
+│
+├─ Calcula tempo de espera = agora - chegada
+│
+├─ Se espera > 15s (TEMPO_LIMITE_ESPERA):
+│     ├─ lock_fila.acquire()
+│     ├─ Remove-se da fila (filtra por id)
+│     ├─ lock_fila.release()
+│     ├─ d_estados[p_id] = 'desistiu'
+│     ├─ Envia log de desistência
+│     └─ TERMINA a thread
+│
+├─ Se d_estados[p_id] == 'embarcado':
+│     ├─ (O servidor mudou o estado durante o embarque)
+│     └─ TERMINA a thread
+│
+└─ time.sleep(0.5)    ← Espera antes de voltar a verificar
+```
+
+**Porquê polling e não eventos?** Porque o `SyncManager` não suporta `Event` ou `Condition` de forma fiável através da rede. O polling a cada 0.5s é simples e eficiente o suficiente para esta simulação.
+
+### 6.2. Função `gerar_clientes()` (linhas 74–127)
+
+#### Ligação ao Servidor (linhas 75–91)
+
+```python
+get_client_manager()     # Regista os nomes dos métodos (sem callable)
+manager = SharedMemoryManager(address=(SERVER_IP, SERVER_PORT), authkey=AUTHKEY)
+manager.connect()        # Estabelece ligação TCP ao servidor
+```
+
+Se a ligação falhar (servidor não está a correr, IP errado, porta bloqueada), o `except` apanha o erro e mostra uma mensagem amigável.
+
+#### Ciclo de Geração (linhas 93–120)
+
+```
+REPETE indefinidamente:
+│
+├─ Sorteia prioridade com distribuição:
+│     ├─ 20% → ALTA (Primeira Classe)
+│     ├─ 30% → MEDIA (Executiva)
+│     └─ 50% → BAIXA (Económica)
+│
+├─ Lança Thread(passageiro_process) com essa prioridade
+│
+├─ Com 10% de probabilidade → SURTO:
+│     └─ Lança 3 a 6 passageiros extra (todos BAIXA) de uma só vez
+│
+└─ time.sleep(1.0 a 4.0 segundos aleatórios)
+```
+
+**Surtos de alta procura:** Simulam os "cenários de alta demanda" pedidos no enunciado. Quando ocorre um surto, vários passageiros económicos chegam ao mesmo tempo, sobrecarregando a fila e podendo causar desistências se os recursos estiverem todos ocupados.
+
+---
+
+## 7. Fluxo Completo Passo-a-Passo
+
+Exemplo concreto de um passageiro de Primeira Classe (Prioridade ALTA):
+
+| Passo | Onde | O Que Acontece |
+|---|---|---|
+| 1 | Cliente | `gerar_clientes()` sorteia `prob=0.12` → ALTA. Cria `Thread(passageiro_process, id=5, prio=1)` |
+| 2 | Cliente (Thread 5) | `chegada = time.time()` → regista `1714502400.0` |
+| 3 | Cliente (Thread 5) | `lock_fila.acquire()` → espera se outra thread tem o lock |
+| 4 | Cliente (Thread 5) | Copia fila, insere-se, ordena por `(1, timestamp)`, reescreve com `fila[:]=...` |
+| 5 | Cliente (Thread 5) | `lock_fila.release()` |
+| 6 | Cliente (Thread 5) | `d_estados[5] = 'esperando'`, envia log → entra no ciclo de polling |
+| 7 | Servidor (Main) | No próximo ciclo, `lock_fila.acquire()`, `fila.pop(0)` retira o passageiro 5 (está em 1º porque prio=1) |
+| 8 | Servidor (Main) | `sem_portoes.acquire()` → decrementa de 3→2 (há portão livre) |
+| 9 | Servidor (Main) | `sem_agentes.acquire()` → decrementa de 4→3 (há agente livre) |
+| 10 | Servidor (Main) | Verifica `d_estados[5]` → é `'esperando'`, não desistiu |
+| 11 | Servidor (Main) | Cria `Thread(embarcar_passageiro, passageiro_5)` |
+| 12 | Servidor (Thread Emb.) | Calcula `tempo_embarque=2` (ALTA), regista "COMEÇOU" no log |
+| 13 | Servidor (Thread Emb.) | `time.sleep(2)` — simula o embarque |
+| 14 | Servidor (Thread Emb.) | `d_estados[5] = 'embarcado'` |
+| 15 | Servidor (Thread Emb.) | `sem_portoes.release()` → 2→3, `sem_agentes.release()` → 3→4 |
+| 16 | Cliente (Thread 5) | No próximo poll (0.5s), lê `d_estados[5] == 'embarcado'` → imprime sucesso e termina |
+
+---
+
+## 8. Mecanismos de Sincronização
+
+### 8.1. Lock da Fila (`multiprocessing.Lock`)
+
+**Tipo:** Mutex (exclusão mútua binária).
+**Protege:** A lista `_fila_embarque`.
+**Usado por:** Servidor (para fazer `pop(0)`) e Clientes (para fazer `append` + `sort`, ou para se remover em caso de desistência).
+**Garante:** Que dois processos/threads nunca modificam a fila ao mesmo tempo. Sem isto, dois passageiros a inserirem-se simultaneamente poderiam corromper a lista.
+
+### 8.2. Semáforo de Portões (`multiprocessing.Semaphore(3)`)
+
+**Tipo:** Semáforo de contagem.
+**Valor inicial:** 3 (existem 3 portões).
+**`acquire()`:** Decrementa o contador. Se já for 0, **bloqueia** até alguém fazer `release()`.
+**`release()`:** Incrementa o contador.
+**Efeito prático:** No máximo 3 embarques podem ocorrer em simultâneo (um por portão).
+
+### 8.3. Semáforo de Agentes (`multiprocessing.Semaphore(4)`)
+
+Idêntico ao de portões mas com valor 4. Na prática, como `NUM_AGENTES(4) > NUM_PORTOES(3)`, o bottleneck são os portões — haverá sempre pelo menos 1 agente livre. Alterar estes valores na config permite simular cenários diferentes.
+
+### 8.4. `Queue` de Logs (`queue.Queue`)
+
+**Thread-safe por defeito.** O `.put()` e `.get()` são atómicos. Múltiplos clientes podem enviar logs em simultâneo sem corromper a fila.
+
+---
+
+## 9. Diagrama de Sequência
+
+```
+PC 1 (Servidor)                                    PC 2 (Cliente)
+─────────────────                                   ─────────────────
+servidor.py                                         gerador_clientes.py
+    │                                                    │
+    ├─ setup_server_manager()                            │
+    ├─ serve_forever() [Thread]                          │
+    ├─ processa_logs() [Thread]                          │
+    │                                                    │
+    │◄───────────── TCP connect ────────────────────────►│
+    │                                                    │
+    │              [Ciclo Principal]                      │
+    │                                                    ├─ Cria Passageiro Thread
+    │                                                    │     │
+    │◄─── lock.acquire() ───────────────────────────────│─────┤
+    │◄─── fila[:] = [...] ──────────────────────────────│─────┤
+    │◄─── lock.release() ───────────────────────────────│─────┤
+    │◄─── d_estados[id]='esperando' ────────────────────│─────┤
+    │◄─── log_queue.put("entrou") ──────────────────────│─────┤
+    │                                                    │     │
+    ├─ lock.acquire()                                    │     ├─ poll: d_estados[id]?
+    ├─ passageiro = fila.pop(0)                          │     │
+    ├─ lock.release()                                    │     │
+    ├─ sem_portoes.acquire()                             │     │
+    ├─ sem_agentes.acquire()                             │     │
+    ├─ Thread(embarcar)                                  │     │
+    │     ├─ sleep(tempo)                                │     ├─ poll: d_estados[id]?
+    │     ├─ d_estados[id]='embarcado'───────────────────│────►│
+    │     ├─ sem_portoes.release()                       │     └─ "sucesso!" → Thread morre
+    │     └─ sem_agentes.release()                       │
+    │                                                    │
+```
+
+---
+
+## 10. Como Executar (2 PCs)
+
+### Pré-requisitos
+- Python 3.8+ instalado em ambos os PCs
+- Ambos os PCs na **mesma rede WiFi/LAN**
+- Nenhuma firewall a bloquear a porta 50000
+
+### Passo 1 — Descobrir o IP do Servidor
+No PC que vai correr o servidor, abrir terminal:
+- **macOS**: `ifconfig | grep "inet "`
+- **Linux**: `hostname -I`
+- **Windows**: `ipconfig`
+
+Procurar um IP do tipo `192.168.x.x` ou `10.0.x.x`.
+
+### Passo 2 — Configurar
+No ficheiro `common/config.py`, no PC do **Cliente**, alterar:
+```python
+SERVER_IP = '192.168.1.100'  # ← IP real do PC servidor
+```
+
+### Passo 3 — Executar
+1. **PC Servidor**: `python3 aeroportoServidor/servidor.py`
+2. **PC Cliente**: `python3 passageirosCliente/gerador_clientes.py`
+
+O servidor mostra os embarques. O cliente mostra as chegadas e desistências. Ambos partilham o estado em tempo real.
+
+### Para testar no mesmo PC
+Manter `SERVER_IP = '127.0.0.1'` e abrir **dois terminais** separados.
