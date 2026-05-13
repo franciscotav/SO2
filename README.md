@@ -165,14 +165,15 @@ Esta função é executada numa **thread separada** para cada passageiro que emb
    - Média (2): **3 segundos**
    - Baixa (3): **4 segundos**
 2. Calcula o tempo total de espera: `time.time() - chegada`
-3. Regista no log: "COMEÇOU o embarque"
-4. `time.sleep(tempo_embarque)` — Simula o tempo de embarque
-5. Atualiza `d_estados[p_id] = 'embarcado'` — O cliente que está em polling vai detetar isto
-6. `sem_portoes.release()` — Devolve 1 ao contador do semáforo (portão fica livre)
-7. `sem_agentes.release()` — Devolve 1 ao contador do semáforo (agente fica livre)
-8. Regista no log: "TERMINOU o embarque"
+3. **Verificação rigorosa de estado (Race Condition):** Verifica estritamente se `d_estados[p_id] == 'desistiu'`. Isto evita que um passageiro que desista imediatamente antes da thread iniciar seja "ressuscitado". Se desistiu, liberta os recursos e termina.
+4. Regista no log: "COMEÇOU o embarque"
+5. `time.sleep(tempo_embarque)` — Simula o tempo de embarque
+6. Atualiza `d_estados[p_id] = 'embarcado'` — (Desde que não tenha desistido)
+7. `sem_portoes.release()` — Devolve 1 ao contador do semáforo (portão fica livre)
+8. `sem_agentes.release()` — Devolve 1 ao contador do semáforo (agente fica livre)
+9. Regista no log: "TERMINOU o embarque"
 
-**Importante**: O `acquire()` dos semáforos é feito no ciclo principal (antes de lançar esta thread). O `release()` é feito aqui dentro (depois do embarque terminar). Isto garante que os recursos ficam reservados durante todo o embarque.
+**Importante**: O `acquire()` dos semáforos é feito no ciclo principal (antes de lançar esta thread). O `release()` é feito aqui dentro (depois do embarque terminar ou em caso de desistência tardia). Isto garante que os recursos ficam reservados durante todo o embarque.
 
 ### 5.4. Função `main()` (linhas 62–136) — O Coração do Servidor
 
@@ -201,16 +202,21 @@ fila = local_client.get_fila()
 
 Este é o ciclo infinito que gere o fluxo do aeroporto:
 
-```
+```text
 REPETE indefinidamente:
 │
-├─ 1. lock_fila.acquire()                    ← Pede exclusão mútua
-│     ├─ Se fila não vazia → pop(0)          ← Remove o 1º (mais prioritário)
-│     └─ lock_fila.release()                 ← Liberta o lock SEMPRE (try/finally)
+├─ 1. lock_fila.acquire()                    ← Verifica se a fila tem pessoas
+│     ├─ q_len = len(fila)                   ← Vê o tamanho da fila
+│     └─ lock_fila.release()
 │
-├─ 2. Se obteve passageiro:
-│     ├─ sem_portoes.acquire()               ← BLOQUEIA até haver portão livre
-│     ├─ sem_agentes.acquire()               ← BLOQUEIA até haver agente livre
+├─ 2. Se a fila não estiver vazia:
+│     ├─ sem_portoes.acquire()               ← BLOQUEIA até haver portão livre (ANTES do pop)
+│     ├─ sem_agentes.acquire()               ← BLOQUEIA até haver agente livre (ANTES do pop)
+│     │
+│     ├─ lock_fila.acquire()                 ← Agora sim, vamos buscar o passageiro
+│     ├─ Se fila não vazia → passageiro = fila.pop(0)
+│     ├─ lock_fila.release()
+│     │
 │     ├─ Verifica se o passageiro desistiu   ← Se sim, devolve recursos e ignora
 │     └─ Thread(embarcar_passageiro)         ← Lança embarque em paralelo
 │
@@ -218,7 +224,11 @@ REPETE indefinidamente:
       └─ time.sleep(0.5)                     ← Evita busy-waiting (poupa CPU)
 ```
 
-**Detalhe crítico sobre o `pop(0)` + `acquire()`:** O passageiro é retirado da fila **antes** dos recursos serem adquiridos. Isto significa que, se não houver portões/agentes livres, o servidor fica bloqueado no `acquire()` a segurar aquele passageiro. Nenhum outro passageiro é processado enquanto o recurso não ficar livre. Isto é intencional: garante ordem FIFO dentro da mesma prioridade.
+**Detalhe Crítico: Solução para a Inversão de Prioridade**
+O servidor agora adquire os semáforos **antes** de retirar o passageiro da fila. Se não houver portões livres, ele bloqueia nos semáforos enquanto o passageiro continua intacto na fila. Isto permite que, se um passageiro VIP (Alta Prioridade) chegar nesse meio tempo, o cliente coloque esse VIP no topo da fila. Assim que um portão libertar, o servidor fará o `pop(0)` e vai atender o VIP imediatamente, resolvendo o problema de Inversão de Prioridade clássico.
+
+### 5.5. Encerramento Gracioso (Graceful Shutdown)
+A função `main()` está envolvida num bloco `try/finally`. Como o servidor IPC foi criado através de `manager.get_server()` e está a correr numa `Thread(daemon=True)`, ele não corre num processo-filho isolado (o que exigiria `manager.shutdown()`). Sendo uma thread daemon, assim que o processo principal recebe o `Ctrl+C` (KeyboardInterrupt) e executa o `sys.exit(0)` no bloco `finally`, o sistema operativo liberta imediatamente a thread e as ligações TCP locais, garantindo um fecho limpo e sem sockets órfãos.
 
 ---
 

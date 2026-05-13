@@ -45,13 +45,22 @@ def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
     tempo_embarque = 2 if prioridade == config.PRIORIDADES['ALTA'] else (3 if prioridade == config.PRIORIDADES['MEDIA'] else 4)
     
     espera_total = time.time() - chegada
+    
+    # Verificação estrita antes de começar (Race condition)
+    if d_estados.get(p_id) == 'desistiu':
+        logger.info(f"O Passageiro {p_id} desistiu imediatamente antes do embarque.")
+        sem_portoes.release()
+        sem_agentes.release()
+        return
+
     logger.info(f"O Passageiro {p_id} (Prioridade {prioridade}) COMEÇOU o embarque. Esperou {espera_total:.1f}s.")
     
     # Simula embarque
     time.sleep(tempo_embarque)
     
-    # Atualiza o estado
-    d_estados[p_id] = 'embarcado'
+    # Atualiza o estado (se não desistiu, na verdade já não desiste durante o embarque)
+    if d_estados.get(p_id) != 'desistiu':
+        d_estados[p_id] = 'embarcado'
     
     # Liberta recursos
     sem_portoes.release()
@@ -99,37 +108,50 @@ def main():
     
     try:
         while True:
-            passageiro = None
-            
+            # Verifica se há alguém na fila antes de bloquear nos semáforos (evita Inversão de Prioridade)
             lock_fila.acquire()
-            try:
-                # Filtrar desistentes caso existam, embora o cliente trate de se remover
-                if len(fila) > 0:
-                    passageiro = fila.pop(0)
-            finally:
-                lock_fila.release()
-                
-            if passageiro:
-                p_id = passageiro['id']
-                # Tenta adquirir recursos. Fica em espera até haver portões e agentes disponíveis
+            q_len = len(fila)
+            lock_fila.release()
+            
+            if q_len > 0:
+                # Tenta adquirir recursos ANTES de retirar a pessoa da fila
                 sem_portoes.acquire()
                 sem_agentes.acquire()
                 
-                # Se o passageiro já desistiu antes de chegar a sua vez (pode ser raro, mas pode acontecer)
-                if d_estados.get(p_id) == 'desistiu':
+                passageiro = None
+                lock_fila.acquire()
+                try:
+                    if len(fila) > 0:
+                        passageiro = fila.pop(0)
+                finally:
+                    lock_fila.release()
+                    
+                if passageiro:
+                    p_id = passageiro['id']
+                    
+                    # Se o passageiro já desistiu antes de chegar a sua vez
+                    if d_estados.get(p_id) == 'desistiu':
+                        sem_portoes.release()
+                        sem_agentes.release()
+                        continue
+                    
+                    # Inicia o agente de embarque numa nova thread
+                    t = threading.Thread(target=embarcar_passageiro, args=(passageiro, sem_portoes, sem_agentes, d_estados))
+                    t.start()
+                else:
+                    # Fila ficou vazia entretanto, libertar recursos
                     sem_portoes.release()
                     sem_agentes.release()
-                    continue
-                
-                # Inicia o agente de embarque numa nova thread
-                t = threading.Thread(target=embarcar_passageiro, args=(passageiro, sem_portoes, sem_agentes, d_estados))
-                t.start()
             else:
                 # Espera curta para não consumir muito CPU
                 time.sleep(0.5)
                 
     except KeyboardInterrupt:
         logger.info("A encerrar o aeroporto.")
+    finally:
+        logger.info("A desligar o Manager IPC e a libertar todos recursos.")
+        # Como o servidor foi criado com get_server() e serve_forever() numa thread daemon,
+        # ele morre automaticamente com o processo. Não existe método shutdown() neste modo.
         sys.exit(0)
 
 if __name__ == "__main__":
