@@ -164,14 +164,15 @@ Esta função é executada numa **thread separada** para cada passageiro que emb
    - Alta (1): **2 segundos**
    - Média (2): **3 segundos**
    - Baixa (3): **4 segundos**
-2. Calcula o tempo total de espera: `time.time() - chegada`
-3. **Verificação rigorosa de estado (Race Condition):** Verifica estritamente se `d_estados[p_id] == 'desistiu'`. Isto evita que um passageiro que desista imediatamente antes da thread iniciar seja "ressuscitado". Se desistiu, liberta os recursos e termina.
-4. Regista no log: "COMEÇOU o embarque"
-5. `time.sleep(tempo_embarque)` — Simula o tempo de embarque
-6. Atualiza `d_estados[p_id] = 'embarcado'` — (Desde que não tenha desistido)
-7. `sem_portoes.release()` — Devolve 1 ao contador do semáforo (portão fica livre)
-8. `sem_agentes.release()` — Devolve 1 ao contador do semáforo (agente fica livre)
-9. Regista no log: "TERMINOU o embarque"
+2. Regista timestamps de chegada e embarque formatados (`HH:MM:SS`).
+3. Calcula o tempo total de espera: `time.now() - chegada`
+4. **Verificação rigorosa de estado (Race Condition):** Verifica estritamente se `d_estados[p_id] == 'desistiu'`.
+5. Regista no log: "COMEÇOU o embarque" com hora de chegada e embarque explícitas.
+6. `time.sleep(tempo_embarque)` — Simula o tempo de embarque
+7. Atualiza `d_estados[p_id] = 'embarcado'`
+8. `sem_portoes.release()` — Devolve 1 ao contador do semáforo
+9. `sem_agentes.release()` — Devolve 1 ao contador do semáforo
+10. Regista no log: "TERMINOU o embarque" com a hora de conclusão.
 
 **Importante**: O `acquire()` dos semáforos é feito no ciclo principal (antes de lançar esta thread). O `release()` é feito aqui dentro (depois do embarque terminar ou em caso de desistência tardia). Isto garante que os recursos ficam reservados durante todo o embarque.
 
@@ -209,23 +210,28 @@ REPETE indefinidamente:
 │     ├─ q_len = len(fila)                   ← Vê o tamanho da fila
 │     └─ lock_fila.release()
 │
-├─ 2. Se a fila não estiver vazia:
-│     ├─ sem_portoes.acquire()               ← BLOQUEIA até haver portão livre (ANTES do pop)
-│     ├─ sem_agentes.acquire()               ← BLOQUEIA até haver agente livre (ANTES do pop)
+├─ 2. Visualização de Estado (periódica)      ← Imprime status a cada ~5 seg
+│
+├─ 3. Se a fila não estiver vazia:
+│     ├─ sem_portoes.acquire()               ← BLOQUEIA até haver portão livre
+│     ├─ sem_agentes.acquire()               ← BLOQUEIA até haver agente livre
 │     │
-│     ├─ lock_fila.acquire()                 ← Agora sim, vamos buscar o passageiro
-│     ├─ Se fila não vazia → passageiro = fila.pop(0)
+│     ├─ lock_fila.acquire()                 ← Fase de Ordenação e Filtração
+│     ├─ │  1. lista_local = list(fila)
+│     ├─ │  2. Filtra desistentes            ← Remove quem desistiu no entretanto
+│     ├─ │  3. Sort (Prioridade, Chegada)    ← Garante que o melhor entra primeiro
+│     ├─ │  4. passageiro = pop(0)           ← Retira o escolhido
+│     ├─ │  5. fila[:] = lista_local         ← Devolve a fila limpa e ordenada
 │     ├─ lock_fila.release()
 │     │
-│     ├─ Verifica se o passageiro desistiu   ← Se sim, devolve recursos e ignora
 │     └─ Thread(embarcar_passageiro)         ← Lança embarque em paralelo
 │
-└─ 3. Se fila vazia:
+└─ 4. Se fila vazia:
       └─ time.sleep(0.5)                     ← Evita busy-waiting (poupa CPU)
 ```
 
-**Detalhe Crítico: Solução para a Inversão de Prioridade**
-O servidor agora adquire os semáforos **antes** de retirar o passageiro da fila. Se não houver portões livres, ele bloqueia nos semáforos enquanto o passageiro continua intacto na fila. Isto permite que, se um passageiro VIP (Alta Prioridade) chegar nesse meio tempo, o cliente coloque esse VIP no topo da fila. Assim que um portão libertar, o servidor fará o `pop(0)` e vai atender o VIP imediatamente, resolvendo o problema de Inversão de Prioridade clássico.
+**Detalhe Crítico: Centralização da Inteligência**
+O servidor agora assume a responsabilidade total pela fila. Em vez de confiar que o cliente se ordena, o servidor re-ordena a lista e limpa "passageiros fantasmas" (desistentes) no momento exato em que os recursos ficam disponíveis. Isto resolve o problema da **Inversão de Prioridade** e garante que a memória partilhada é gerida de forma autoritária pelo servidor, permitindo que qualquer passageiro VIP que chegue enquanto o servidor espera por um portão seja atendido imediatamente assim que um recurso for libertado.
 
 ### 5.5. Encerramento Gracioso (Graceful Shutdown)
 A função `main()` está envolvida num bloco `try/finally`. Como o servidor IPC foi criado através de `manager.get_server()` e está a correr numa `Thread(daemon=True)`, ele não corre num processo-filho isolado (o que exigiria `manager.shutdown()`). Sendo uma thread daemon, assim que o processo principal recebe o `Ctrl+C` (KeyboardInterrupt) e executa o `sys.exit(0)` no bloco `finally`, o sistema operativo liberta imediatamente a thread e as ligações TCP locais, garantindo um fecho limpo e sem sockets órfãos.
@@ -245,14 +251,11 @@ chegada = time.time()                          # Regista timestamp UNIX da chega
 passageiro_info = {'id': p_id, 'prioridade': prioridade, 'chegada': chegada}
 
 lock_fila.acquire()                            # Pede acesso exclusivo à fila
-lista_local = list(fila)                       # Copia a fila remota para local
-lista_local.append(passageiro_info)            # Adiciona-se
-lista_local.sort(key=lambda x: (x['prioridade'], x['chegada']))  # Ordena
-fila[:] = lista_local                          # Reescreve a fila remota
+fila.append(passageiro_info)                   # Adiciona-se ao fim da fila
 lock_fila.release()                            # Liberta o lock
 ```
 
-**Porquê copiar → modificar → reescrever?** O `ListProxy` do Manager suporta `append()`, mas **não suporta `.sort()`** diretamente. A operação `fila[:] = lista_local` substitui todo o conteúdo da lista remota de uma vez, o que é uma operação atómica do proxy.
+**Porquê apenas append()?** Agora que o servidor centraliza a ordenação, o cliente já não precisa de copiar a lista nem de a ordenar. Isto reduz o tempo de retenção do `Lock` e torna a comunicação muito mais eficiente. O servidor encarregar-se-á de colocar o passageiro na posição correta antes de o chamar para embarcar.
 
 **Critério de ordenação:** `(prioridade, chegada)` — Ordena primeiro por prioridade (1 antes de 3), e em caso de empate, por ordem de chegada (FIFO). Assim, um passageiro de Primeira Classe que chegou às 12:05 fica à frente de um de Económica que chegou às 12:01.
 
@@ -268,13 +271,11 @@ REPETE a cada 0.5 segundos:
 ├─ Calcula tempo de espera = agora - chegada
 │
 ├─ Se espera > 15s (TEMPO_LIMITE_ESPERA):
-│     ├─ lock_fila.acquire()
-│     ├─ Remove-se da fila (filtra por id)
-│     ├─ lock_fila.release()
 │     ├─ d_estados[p_id] = 'desistiu'
 │     ├─ Envia log de desistência
 │     └─ TERMINA a thread
 │
+**Nota sobre remoção**: O cliente já não se remove fisicamente da lista `fila`. Ele apenas marca o seu estado como `'desistiu'` no dicionário partilhado. O servidor, ao processar a fila, ignora e remove automaticamente qualquer passageiro com este estado. Isto evita condições de corrida complexas na manipulação da lista.
 ├─ Se d_estados[p_id] == 'embarcado':
 │     ├─ (O servidor mudou o estado durante o embarque)
 │     └─ TERMINA a thread

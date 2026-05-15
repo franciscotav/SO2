@@ -25,17 +25,9 @@ def passageiro_process(p_id, prioridade, fila, lock_fila, d_estados, log_queue):
         # Adicionar o passageiro à fila partilhada de forma segura (Lock)
         lock_fila.acquire()
         try:
-            # A manipulação de listas no Manager exige reatribuição ou métodos próprios
-            # Vamos copiar, modificar, e reatribuir ou usar os métodos
-            # O list proxy suporta append, mas para o sort() funcionar bem com proxy,
-            # muitas vezes é melhor converter localmente e reatribuir
-            lista_local = list(fila)
-            lista_local.append(passageiro_info)
-            # Ordem: 1º Prioridade (ascendente, 1=alta), 2º Tempo Chegada (ascendente, FIFO)
-            lista_local.sort(key=lambda x: (x['prioridade'], x['chegada']))
-            
-            # Atualiza a fila remota
-            fila[:] = lista_local
+            # O cliente apenas se adiciona ao fim da fila
+            # O Servidor encarregar-se-á de ordenar por prioridade antes de chamar
+            fila.append(passageiro_info)
         finally:
             lock_fila.release()
         
@@ -47,27 +39,26 @@ def passageiro_process(p_id, prioridade, fila, lock_fila, d_estados, log_queue):
         
         # Aguardar até ser atendido
         while True:
+            estado = d_estados.get(p_id)
+            
+            # Se já terminou o embarque
+            if estado == 'embarcado':
+                print(f"[Cliente] Passageiro {p_id} concluiu o embarque com sucesso.")
+                break
+                
+            # Se já está a embarcar (no portão), ignora o timeout de desistência
+            if estado == 'embarcando':
+                time.sleep(0.5)
+                continue
+                
             espera = time.time() - chegada
             
-            # Verifica se passou o limite de tempo de espera
+            # Verifica se passou o limite de tempo de espera (apenas se ainda estiver 'esperando')
             if espera > config.TEMPO_LIMITE_ESPERA:
-                # Desiste
-                lock_fila.acquire()
-                try:
-                    lista_local = list(fila)
-                    lista_local = [p for p in lista_local if p['id'] != p_id]
-                    fila[:] = lista_local
-                finally:
-                    lock_fila.release()
-                    
+                # Desiste — apenas marca o estado, o Servidor tratará de o remover da fila
                 d_estados[p_id] = 'desistiu'
                 log_queue.put(f"Passageiro {p_id} DESISTIU após {espera:.1f}s de espera na fila.")
                 print(f"[Cliente] Passageiro {p_id} DESISTIU.")
-                break
-                
-            # Verifica se já terminou o embarque
-            if d_estados.get(p_id) == 'embarcado':
-                print(f"[Cliente] Passageiro {p_id} concluiu o embarque com sucesso.")
                 break
                 
             time.sleep(0.5)
@@ -112,7 +103,7 @@ def gerar_clientes():
             p_id += 1
             
             # Simula alta procura: às vezes gera múltiplos rápido
-            if random.random() < 0.1: # 10% de chance de surto
+            if random.random() < (config.TEMPO_ALTA_PROCURA / 100): # 15% de chance de surto
                 print("--- SURTO DE PASSAGEIROS ---")
                 for _ in range(random.randint(3, 6)):
                     t_surto = threading.Thread(target=passageiro_process, args=(p_id, config.PRIORIDADES['BAIXA'], fila, lock_fila, d_estados, log_queue))

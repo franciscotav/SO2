@@ -3,6 +3,7 @@ import os
 import time
 import threading
 import logging
+from datetime import datetime
 
 # Adicionar a diretoria principal ao path para importar 'common'
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -27,11 +28,10 @@ def processa_logs(log_queue):
     while True:
         try:
             msg = log_queue.get()
-            if msg == "STOP":
-                break
             logger.info(f"(Cliente) {msg}")
         except Exception:
             pass
+
 
 def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
     """
@@ -45,6 +45,8 @@ def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
     tempo_embarque = 2 if prioridade == config.PRIORIDADES['ALTA'] else (3 if prioridade == config.PRIORIDADES['MEDIA'] else 4)
     
     espera_total = time.time() - chegada
+    hora_chegada = datetime.fromtimestamp(chegada).strftime('%H:%M:%S')
+    hora_embarque = datetime.now().strftime('%H:%M:%S')
     
     # Verificação estrita antes de começar (Race condition)
     if d_estados.get(p_id) == 'desistiu':
@@ -53,7 +55,10 @@ def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
         sem_agentes.release()
         return
 
-    logger.info(f"O Passageiro {p_id} (Prioridade {prioridade}) COMEÇOU o embarque. Esperou {espera_total:.1f}s.")
+    # MARCA COMO EMBARCANDO IMEDIATAMENTE para o cliente saber que já não pode desistir
+    d_estados[p_id] = 'embarcando'
+
+    logger.info(f"O Passageiro {p_id} (Prioridade {prioridade}) COMEÇOU o embarque. Chegou às {hora_chegada}, embarcou às {hora_embarque}. Esperou {espera_total:.1f}s.")
     
     # Simula embarque
     time.sleep(tempo_embarque)
@@ -66,7 +71,8 @@ def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
     sem_portoes.release()
     sem_agentes.release()
     
-    logger.info(f"O Passageiro {p_id} TERMINOU o embarque. Duração do embarque: {tempo_embarque}s.")
+    hora_fim = datetime.now().strftime('%H:%M:%S')
+    logger.info(f"O Passageiro {p_id} TERMINOU o embarque às {hora_fim}. Duração do embarque: {tempo_embarque}s.")
 
 def main():
     logger.info("A iniciar o Servidor (Aeroporto)...")
@@ -106,12 +112,21 @@ def main():
     
     logger.info(f"Aeroporto aberto: {config.NUM_PORTOES} Portões e {config.NUM_AGENTES} Agentes.")
     
+    # Contador para visualização periódica do estado do aeroporto
+    ciclo_status = 0
+    
     try:
         while True:
             # Verifica se há alguém na fila antes de bloquear nos semáforos (evita Inversão de Prioridade)
             lock_fila.acquire()
             q_len = len(fila)
             lock_fila.release()
+            
+            # Visualização periódica do estado do aeroporto (a cada ~5 segundos quando a fila está vazia)
+            ciclo_status += 1
+            if ciclo_status >= 10:  # 10 ciclos * 0.5s = ~5 segundos
+                ciclo_status = 0
+                logger.info(f"[STATUS] Passageiros na fila: {q_len} | Portões: {config.NUM_PORTOES} | Agentes: {config.NUM_AGENTES}")
             
             if q_len > 0:
                 # Tenta adquirir recursos ANTES de retirar a pessoa da fila
@@ -122,18 +137,26 @@ def main():
                 lock_fila.acquire()
                 try:
                     if len(fila) > 0:
-                        passageiro = fila.pop(0)
+                        # O Servidor assume a responsabilidade de ordenar e filtrar a fila
+                        lista_local = list(fila)
+                        
+                        # Filtra passageiros que já desistiram (o Cliente marca o estado, o Servidor limpa a fila)
+                        lista_local = [p for p in lista_local if d_estados.get(p['id']) != 'desistiu']
+                        
+                        if lista_local:
+                            # Ordem: 1º Prioridade (1=alta), 2º Tempo Chegada (FIFO)
+                            lista_local.sort(key=lambda x: (x['prioridade'], x['chegada']))
+                            
+                            # Retira o passageiro mais prioritário
+                            passageiro = lista_local.pop(0)
+                        
+                        # Atualiza a fila remota (já sem desistentes e sem o passageiro escolhido)
+                        fila[:] = lista_local
                 finally:
                     lock_fila.release()
                     
                 if passageiro:
                     p_id = passageiro['id']
-                    
-                    # Se o passageiro já desistiu antes de chegar a sua vez
-                    if d_estados.get(p_id) == 'desistiu':
-                        sem_portoes.release()
-                        sem_agentes.release()
-                        continue
                     
                     # Inicia o agente de embarque numa nova thread
                     t = threading.Thread(target=embarcar_passageiro, args=(passageiro, sem_portoes, sem_agentes, d_estados))

@@ -13,7 +13,7 @@ NUM_AGENTES = 4
 
 # Tempos e Limites
 TEMPO_LIMITE_ESPERA = 15  # Segundos até o passageiro desistir
-TEMPO_ALTA_PROCURA = 10   # Probabilidade maior de gerar muitos clientes
+TEMPO_ALTA_PROCURA = 15   # Probabilidade maior de gerar muitos clientes
 
 # Prioridades
 # 1 - Alta (Primeira Classe / Urgente)
