@@ -8,18 +8,19 @@ from datetime import datetime
 # Adicionar a diretoria principal ao path para importar 'common'
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# ── Rich: Display Dashboard ──
+from common.display import AirportDisplay, DisplayHandler
 from common import config
 from common.ipc_manager import setup_server_manager, SharedMemoryManager
 
 # Configuração do Logging
 logger = logging.getLogger('Aeroporto')
 logger.setLevel(logging.INFO)
+# Handler para ficheiro (mantém formato texto simples para análise)
 fh = logging.FileHandler(os.path.join(os.path.dirname(__file__), 'aeroporto.log'))
 fh.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s'))
 logger.addHandler(fh)
-ch = logging.StreamHandler()
-ch.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s'))
-logger.addHandler(ch)
+# DisplayHandler será adicionado depois do display ser inicializado (em main())
 
 def processa_logs(log_queue):
     """
@@ -33,7 +34,7 @@ def processa_logs(log_queue):
             pass
 
 
-def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
+def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados, display):
     """
     Simula o processo de embarque para um passageiro.
     """
@@ -53,6 +54,7 @@ def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
         logger.info(f"O Passageiro {p_id} desistiu imediatamente antes do embarque.")
         sem_portoes.release()
         sem_agentes.release()
+        display.recurso_libertado()  # ── Atualiza barra do dashboard
         return
 
     # MARCA COMO EMBARCANDO IMEDIATAMENTE para o cliente saber que já não pode desistir
@@ -70,6 +72,7 @@ def embarcar_passageiro(passageiro, sem_portoes, sem_agentes, d_estados):
     # Liberta recursos
     sem_portoes.release()
     sem_agentes.release()
+    display.recurso_libertado()  # ── Atualiza barra do dashboard
     
     hora_fim = datetime.now().strftime('%H:%M:%S')
     logger.info(f"O Passageiro {p_id} TERMINOU o embarque às {hora_fim}. Duração do embarque: {tempo_embarque}s.")
@@ -105,6 +108,13 @@ def main():
     sem_agentes = local_client.get_agentes()
     d_estados = local_client.get_estados()
     log_queue = local_client.get_logs()
+
+    # ── Inicializa o Dashboard Rich ──
+    display = AirportDisplay(fila, lock_fila, config.NUM_PORTOES, config.NUM_AGENTES)
+    dh = DisplayHandler(display)
+    dh.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(dh)
+    display.start()
     
     # Iniciar a thread que processa logs remotos
     t_log = threading.Thread(target=processa_logs, args=(log_queue,), daemon=True)
@@ -112,26 +122,20 @@ def main():
     
     logger.info(f"Aeroporto aberto: {config.NUM_PORTOES} Portões e {config.NUM_AGENTES} Agentes.")
     
-    # Contador para visualização periódica do estado do aeroporto
-    ciclo_status = 0
+    # Contador já não é necessário (o display atualiza automaticamente)
     
     try:
         while True:
-            # Verifica se há alguém na fila antes de bloquear nos semáforos (evita Inversão de Prioridade)
+            # Verifica se há alguém na fila antes de bloquear nos semáforos
             lock_fila.acquire()
             q_len = len(fila)
             lock_fila.release()
-            
-            # Visualização periódica do estado do aeroporto (a cada ~5 segundos quando a fila está vazia)
-            ciclo_status += 1
-            if ciclo_status >= 10:  # 10 ciclos * 0.5s = ~5 segundos
-                ciclo_status = 0
-                logger.info(f"[STATUS] Passageiros na fila: {q_len} | Portões: {config.NUM_PORTOES} | Agentes: {config.NUM_AGENTES}")
             
             if q_len > 0:
                 # Tenta adquirir recursos ANTES de retirar a pessoa da fila
                 sem_portoes.acquire()
                 sem_agentes.acquire()
+                display.recurso_adquirido()  # ── Atualiza barra do dashboard
                 
                 passageiro = None
                 lock_fila.acquire()
@@ -140,14 +144,12 @@ def main():
                         # O Servidor assume a responsabilidade de ordenar e filtrar a fila
                         lista_local = list(fila)
                         
-                        # Filtra passageiros que já desistiram (o Cliente marca o estado, o Servidor limpa a fila)
+                        # Filtra passageiros que já desistiram
                         lista_local = [p for p in lista_local if d_estados.get(p['id']) != 'desistiu']
                         
                         if lista_local:
                             # Ordem: 1º Prioridade (1=alta), 2º Tempo Chegada (FIFO)
                             lista_local.sort(key=lambda x: (x['prioridade'], x['chegada']))
-                            
-                            # Retira o passageiro mais prioritário
                             passageiro = lista_local.pop(0)
                         
                         # Atualiza a fila remota (já sem desistentes e sem o passageiro escolhido)
@@ -156,15 +158,14 @@ def main():
                     lock_fila.release()
                     
                 if passageiro:
-                    p_id = passageiro['id']
-                    
-                    # Inicia o agente de embarque numa nova thread
-                    t = threading.Thread(target=embarcar_passageiro, args=(passageiro, sem_portoes, sem_agentes, d_estados))
+                    # Inicia o agente de embarque numa nova thread (passa display para atualizar contadores)
+                    t = threading.Thread(target=embarcar_passageiro, args=(passageiro, sem_portoes, sem_agentes, d_estados, display))
                     t.start()
                 else:
                     # Fila ficou vazia entretanto, libertar recursos
                     sem_portoes.release()
                     sem_agentes.release()
+                    display.recurso_libertado()  # ── Atualiza barra do dashboard
             else:
                 # Espera curta para não consumir muito CPU
                 time.sleep(0.5)
@@ -172,9 +173,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("A encerrar o aeroporto.")
     finally:
+        display.stop()  # ── Para o dashboard Rich
         logger.info("A desligar o Manager IPC e a libertar todos recursos.")
-        # Como o servidor foi criado com get_server() e serve_forever() numa thread daemon,
-        # ele morre automaticamente com o processo. Não existe método shutdown() neste modo.
         sys.exit(0)
 
 if __name__ == "__main__":
