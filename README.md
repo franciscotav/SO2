@@ -25,7 +25,13 @@ O sistema simula o embarque de passageiros num aeroporto. Existem dois programas
 
 ### Porquê `SyncManager` e não `shm_open`?
 
-A memória partilhada POSIX nativa (`shm_open`, `mmap`) só funciona entre processos **no mesmo computador**. Como o enunciado exige que o sistema funcione em **2 PCs diferentes na mesma rede**, usamos o `multiprocessing.managers.SyncManager` do Python. Este cria um servidor TCP que expõe objetos Python (listas, dicionários, locks, semáforos) pela rede. Os clientes ligam-se via TCP e manipulam esses objetos remotamente através de **objetos proxy**, como se fossem locais. Internamente, cada chamada a um método do proxy é serializada, enviada pela rede, executada no servidor, e o resultado é devolvido — tudo de forma transparente.
+Internamente, cada chamada a um método do proxy é serializada, enviada pela rede, executada no servidor, e o resultado é devolvido — tudo de forma transparente.
+
+### Tecnologias Utilizadas
+- **Multiprocessing (SyncManager)**: Para memória partilhada distribuída.
+- **Threading**: Para concorrência e processos de embarque em paralelo.
+- **Rich**: Para a interface de terminal (Dashboard Real-time e logs coloridos).
+- **Python 3.8+**: Linguagem base.
 
 ---
 
@@ -36,7 +42,8 @@ SO2/
 ├── common/                          # Código partilhado entre Servidor e Cliente
 │   ├── __init__.py                  # Torna 'common' num pacote Python importável
 │   ├── config.py                    # Todas as constantes de configuração
-│   └── ipc_manager.py              # Definição do Manager e registo dos objetos partilhados
+│   ├── ipc_manager.py               # Definição do Manager e objetos partilhados
+│   └── display.py                   # Dashboard em tempo real (Rich)
 ├── aeroportoServidor/               # Código do Servidor
 │   ├── __init__.py
 │   ├── servidor.py                  # Processo principal do aeroporto
@@ -134,12 +141,10 @@ SharedMemoryManager.register('get_fila')  # sem callable
 ### 5.1. Arranque e Logging (linhas 1–21)
 
 O servidor configura o módulo `logging` do Python com **dois handlers**:
-- `FileHandler` → Escreve no ficheiro `aeroportoServidor/aeroporto.log`
-- `StreamHandler` → Imprime no terminal (stdout)
-
-Formato: `2026-05-06 12:23:17,547 - [INFO] - mensagem`
-
-Ambos os handlers recebem as mesmas mensagens, garantindo que tudo o que aparece no terminal fica também gravado no ficheiro.
+- **Dashboard Real-time (Rich)**: O servidor utiliza um motor de visualização (em `display.py`) que divide o terminal em dois painéis:
+    - **Status (Fixo no topo)**: Mostra passageiros na fila e ocupação dos portões/agentes com barras de progresso.
+    - **Logs (Rolante em baixo)**: Exibe os últimos eventos em tempo real com cores (ex: Verde = Embarque, Vermelho = Desistência).
+- **Registo em Ficheiro**: Mantém o ficheiro `aeroporto.log` com texto simples para auditoria posterior.
 
 ### 5.2. Thread `processa_logs(log_queue)` (linhas 23–34)
 
@@ -415,15 +420,14 @@ servidor.py                                         gerador_clientes.py
 - Ambos os PCs na **mesma rede WiFi/LAN**
 - Nenhuma firewall a bloquear a porta 50000
 
-### Passo 1 — Descobrir o IP do Servidor
-No PC que vai correr o servidor, abrir terminal:
-- **macOS**: `ifconfig | grep "inet "`
-- **Linux**: `hostname -I`
-- **Windows**: `ipconfig`
+### Passo 1 — Instalar Dependências
+Ambos os computadores precisam da biblioteca `Rich` para a interface:
+```bash
+python3 -m pip install -r requirements.txt
+```
+*(No macOS, se der erro de "externally-managed-environment", use a flag `--break-system-packages`)*
 
-Procurar um IP do tipo `192.168.x.x` ou `10.0.x.x`.
-
-### Passo 2 — Configurar
+### Passo 2 — Descobrir o IP do Servidor
 No ficheiro `common/config.py`, no PC do **Cliente**, alterar:
 ```python
 SERVER_IP = '192.168.1.100'  # ← IP real do PC servidor
