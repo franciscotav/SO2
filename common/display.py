@@ -25,7 +25,7 @@ from rich.console import Console
 from rich.columns import Columns
 
 
-# ── Paleta de cores por tipo de evento ──────────────────────────
+# Definição das cores do displays
 _CORES = {
     'entrou':     'cyan',
     'COMEÇOU':    'green',
@@ -38,8 +38,8 @@ _CORES = {
     'default':    'white',
 }
 
+# Função que define a cor da mensagem baseado em certas palavras-chave
 def _colorir(msg: str) -> str:
-    """Aplica cor à mensagem com base em palavras-chave."""
     for chave, cor in _CORES.items():
         if chave in msg:
             return f"[{cor}]{msg}[/{cor}]"
@@ -47,10 +47,10 @@ def _colorir(msg: str) -> str:
 
 
 class AirportDisplay:
-    """
-    Gere o dashboard Rich em tempo real.
-    Thread-safe: pode ser chamado de múltiplas threads simultaneamente.
-    """
+    #Gere o dashboard Rich em tempo real.
+    
+    #Função para iniciar o display, usada no servidor para iniciar o dashboard
+    #Thread-safe: pode ser chamado de múltiplas threads simultaneamente.
 
     def __init__(self, fila, lock_fila, num_portoes, num_agentes):
         self._fila = fila
@@ -106,11 +106,11 @@ class AirportDisplay:
         self._live.start()
 
     def stop(self):
-        """Para o dashboard. Chamar no finally do servidor."""
+        # Parar o display
         if self._live:
             self._live.stop()
 
-    # ── Construção do layout ───────────────────────────────────
+    #Construção do layout
 
     def _refresh(self):
         if self._live:
@@ -127,12 +127,11 @@ class AirportDisplay:
         return layout
 
     def _build_status_panel(self) -> Panel:
-        # Ler tamanho da fila de forma segura
+       
         try:
-            self._lock_fila.acquire()
             q_len = len(self._fila)
-        finally:
-            self._lock_fila.release()
+        except Exception:
+            q_len = 0
 
         with self._recursos_lock:
             portoes_livres = self._num_portoes - self._portoes_em_uso
